@@ -1,0 +1,10 @@
+__pycache__/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+
+# Imitation checkpoints: retrain in ~90 s each; keep only the ones used in the README clips
+models/imitation/*.pt
+!models/imitation/bc_single_step_seed0.pt
+!models/imitation/chunk8_ensemble_seed0.pt
