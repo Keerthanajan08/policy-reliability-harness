@@ -1,21 +1,42 @@
 # Policy Reliability Harness
 
+[![CI](https://github.com/Keerthanajan08/policy-reliability-harness/actions/workflows/ci.yml/badge.svg)](https://github.com/Keerthanajan08/policy-reliability-harness/actions/workflows/ci.yml)
+
 **Train robot-learning policies from demonstrations, measure them honestly, and find out why they fail.**
 
-Robot policies fail quietly. A learned policy doesn't raise an exception when it's out of its depth; it just keeps acting until a person notices the job didn't get done. Getting robots to *last-mile reliability* means building policies and measuring their failures carefully enough to know the cause. This repo does both on PushT, a standard robot-learning benchmark where a pusher must slide a T-shaped block into a target pose:
+On PushT (a standard robot-learning benchmark: slide a T-shaped block into a target pose), trained from scratch on the same 185 human demonstrations and evaluated on the same 100 unseen scenes × 3 training seeds:
 
-- **Part 1: Imitation learning from scratch.** Train policies on 185 human demonstrations and run a controlled ablation of *action chunking* and *temporal ensembling* (the core ideas behind ACT): 6 variants × 3 training seeds × 100 evaluation scenes = **1,800 evaluated episodes**.
-- **Part 2: Diagnosing a pretrained policy.** Take LeRobot's pretrained Diffusion Policy, classify its failures, and test two explanations: a deployment setting (the diffusion sampler) and a monitor driven by the policy's own self-disagreement.
+| Policy | Task success (300 episodes, 95% CI) |
+|---|---|
+| Single-step behaviour cloning | 1% (0–3%) |
+| + action chunking and temporal ensembling (ACT's ideas) | 25% (21–31%) |
+| **Diffusion policy (1D temporal U-Net, built from scratch)** | **60% (54–65%)** |
 
-Everything is evaluated with Wilson 95% intervals and **paired comparisons on identical scenes** (exact McNemar tests), so "better" means better on the same starting conditions, not a lucky draw.
+On identical scenes, the diffusion policy fixed **133** of the best regression policy's failures and broke **30** (exact McNemar p ≈ 10⁻¹⁶). Against a regression policy with *exactly* the same planning horizon and execution, it fixed 153 and broke 13, so the gain comes from modelling the action distribution, not from any other setting.
+
+| Single-step BC ❌ | Chunking + ensembling ❌ | Diffusion policy ✅ |
+|---|---|---|
+| ![single-step BC](results/imitation/clips/bc_single_step_scene1005.gif) | ![chunking + ensembling](results/imitation/clips/chunk8_ensemble_scene1005.gif) | ![diffusion policy](results/imitation/clips/diffusion_scene1005.gif) |
+
+*Same scene, same starting state: scene 1005, training seed 0. Every clip is reproducible from the committed checkpoints.*
+
+The repo has two parts:
+
+- **Part 1: Imitation learning from scratch.** 8 policy variants × 3 training seeds × 100 scenes = **2,400 evaluated episodes**, structured as a chain of controlled ablations: does chunking help, what chunk length, does ensembling help, and does a generative model beat regression at a matched setting.
+- **Part 2: Diagnosing a pretrained policy.** LeRobot's pretrained Diffusion Policy (from camera images): classify its failures, find that the fast sampler causes most of them (53% → 80% with full sampling), and test whether the policy's self-disagreement predicts failure (it doesn't, and the failure analysis explains why).
+
+Every rate carries a Wilson 95% interval, and every "better" is a **paired comparison on identical scenes** (exact McNemar test), not two noisy averages.
 
 ## Part 1: Imitation learning from scratch
 
-**Setup.** Observations are the T-block's 8 keypoints plus the pusher's position (PushT's state-based variant); actions are target positions for the pusher. Every variant uses the same 3-layer MLP (512 units, LayerNorm, GELU), the same L1 loss, 2 frames of observation history, and the same demonstration split (185 for training, 21 held out to pick the checkpoint), so the only thing that differs is **what the network predicts and how those predictions are executed**:
+**Setup.** Observations are the T-block's 8 keypoints plus the pusher's position (PushT's state-based variant). Actions are target positions for the pusher. All variants use 2 frames of observation history and the same demonstration split: 185 for training and 21 held out. The regression variants share one network (a 3-layer MLP, 512 units, LayerNorm, GELU, L1 loss) and differ only in **what they predict and how predictions are executed**:
 
 - **Single-step BC:** predict the next action.
 - **Chunking (k):** predict the next *k* actions and execute them all before asking again.
 - **Chunking + temporal ensembling:** predict *k* actions every step, and execute an exponentially weighted average of every chunk's prediction for the current step (ACT's scheme).
+- **Plan 16 / run 8:** predict 16 actions, execute the first 8, then re-plan (Diffusion Policy's setting).
+
+The **diffusion policy** uses that same plan 16 / run 8 setting, but instead of regressing the action chunk it *samples* one. It starts from random noise and denoises it into a chunk, conditioned on the observations. The denoiser is a conditional 1D U-Net (temporal convolutions over the chunk, FiLM-conditioned on the observations and diffusion step), written from scratch in [`diffusion.py`](policy_reliability/imitation/diffusion.py) and scaled down from Diffusion Policy's to 1.3M parameters so it trains on a CPU. Training uses 100-step DDPM, a squared-cosine schedule, noise prediction and EMA weights. At run time it samples with 10-step DDIM.
 
 ![Imitation learning ablation](results/imitation/success_by_variant.png)
 
@@ -23,26 +44,28 @@ Everything is evaluated with Wilson 95% intervals and **paired comparisons on id
 |---|---|---|
 | Single-step BC | 1% (0–3%) | 2%, 1%, 0% |
 | Chunking (4) | 1% (0–3%) | 1%, 2%, 0% |
-| **Chunking (8)** | **21% (16–26%)** | 19%, 18%, 25% |
+| Chunking (8) | 21% (16–26%) | 19%, 18%, 25% |
 | Chunking (16) | 5% (3–8%) | 4%, 2%, 8% |
-| **Chunking (8) + ensembling** | **25% (21–31%)** | 38%, 13%, 25% |
+| Chunking (8) + ensembling | 25% (21–31%) | 38%, 13%, 25% |
 | Chunking (16) + ensembling | 5% (3–8%) | 2%, 2%, 11% |
+| Regression, plan 16 / run 8 | 13% (10–17%) | 6%, 5%, 28% |
+| **Diffusion, plan 16 / run 8** | **60% (54–65%)** | **65%, 61%, 53%** |
 
-**What the ablation shows:**
+**What the ablations show:**
 
-- **Action chunking is the difference between a policy that works and one that doesn't.** Single-step BC almost never succeeds (1%); predicting 8-step chunks reaches 21%. On the same 300 (seed, scene) pairs, chunking fixed 61 failures and broke 2 (p ≈ 4×10⁻¹⁶). PushT demonstrations are *multimodal* (the same state can be pushed from the left or the right); a single-step regressor averages those modes into a hesitant in-between action, while a chunk commits to one coherent motion.
-- **Chunk length has a sweet spot.** 4 steps is too short to commit (1%, no better than single-step), and 16 steps executes too long without feedback (5%). 8 steps (0.8 s) works best: 8→4 broke 61 scenes and fixed 2; 8→16 broke 59 and fixed 11.
-- **Temporal ensembling is neutral to slightly positive here, not the cause of anything.** At chunk 8 it gave 25% vs 21% (52 fixed vs 38 broken, p = 0.17), with large seed-to-seed variance. A first run that changed chunk length *and* ensembling at once made ensembling look harmful; separating the two factors showed chunk length 16 was responsible.
+- **Action chunking is the difference between a regression policy that works and one that doesn't.** Single-step BC almost never succeeds (1%); predicting 8-step chunks reaches 21% (61 scenes fixed, 2 broken, p ≈ 4×10⁻¹⁶). PushT demonstrations are *multimodal*: the same state can be pushed from the left or the right. A single-step regressor averages those modes into a hesitant in-between action; a chunk at least commits to one coherent motion for a while.
+- **Chunk length has a sweet spot.** 4 steps is too short to commit (1%), 16 executes too long without feedback (5%), and 8 (0.8 s) works best.
+- **Temporal ensembling is neutral to slightly positive, not the cause of anything.** At chunk 8: 25% vs 21% (52 fixed vs 38 broken, p = 0.17), with large seed-to-seed variance. A first run that changed chunk length *and* ensembling at once made ensembling look harmful. Separating the two factors showed that chunk length 16 was responsible.
+- **Regression has a ceiling; a generative model breaks through it.** At an identical horizon and execution, regression reaches 13% and diffusion 60% (153 fixed, 13 broken, p ≈ 10⁻³¹). Chunking only *mitigates* mode averaging. Sampling a chunk from the learned distribution *removes* it, so every chunk is something a demonstrator could actually have done.
+- **The remaining diffusion failures are about precision, not strategy.** 104 of its 121 failures got the block to ≥ 90% of the success bar at some point, then lost it in the final adjustment. That's the same failure type Part 2 traces to the fast sampler, so finer sampling on the final approach is the obvious next test.
 
-Same scene, the two policies:
+### What it took to get there
 
-| Single-step BC: fails ❌ | Chunking (8) + ensembling: succeeds ✅ |
-|---|---|
-| ![single-step BC](results/imitation/clips/bc_single_step_scene1003.gif) | ![chunking](results/imitation/clips/chunk8_ensemble_scene1003.gif) |
+The first diffusion policy used an MLP denoiser on the flattened action chunk. Its samples matched held-out demonstrations closely (first action within ~7 px), yet it succeeded in **1 of 50** scenes. Watching rollouts showed why: it pushed the block to nearly the right pose, then over-corrected. Sampling with 50 DDIM steps instead of 10 didn't help (0 of 20), so it wasn't the sampler. Switching to a **1D temporal U-Net**, whose convolutions over neighbouring time steps make chunks smooth and consistent, took the same training budget to **20 of 50**, and longer training to 60% overall.
 
-**The ceiling:** even the best from-scratch MLP reaches 25%, which is the limit of plain regression on multimodal demonstrations. That's what generative policies (like the diffusion policy in Part 2) exist to fix: they model the *distribution* of actions instead of its average. (Part 2 uses camera images and a different evaluation set, so the numbers aren't directly comparable; the gap is the point, not its exact size.)
+One more lesson: **validation loss is not a model-selection signal for diffusion policies.** From epoch 100 to 250 the held-out denoising loss *rose* (0.034 → 0.041 on all three seeds), while task success on the same 50 scenes went from 20 to 30 of 50 (seed 0; the shorter run used its own learning-rate schedule). So the diffusion checkpoints are the final EMA weights, as in Diffusion Policy, not the lowest validation loss.
 
-Full tables: [`results/imitation/report.md`](results/imitation/report.md).
+Full tables, including every paired comparison: [`results/imitation/report.md`](results/imitation/report.md).
 
 ## Part 2: Diagnosing a pretrained diffusion policy
 
@@ -127,16 +150,19 @@ python -m policy_reliability.run --condition nominal --sampler ddpm100 --samples
 # Tables + charts
 python -m policy_reliability.report
 
-# Part 1: imitation learning (CPU-friendly: ~90 s to train, ~30-50 s to evaluate 100 scenes)
+# Part 1: imitation learning. Regression variants: ~90 s to train on a CPU.
 for seed in 0 1 2; do
-  for v in bc_single_step chunk4 chunk8 chunk16 chunk8_ensemble chunk16_ensemble; do
+  for v in bc_single_step chunk4 chunk8 chunk16 chunk8_ensemble chunk16_ensemble chunk16_exec8; do
     python -m policy_reliability.imitation.train --variant $v --seed $seed
     python -m policy_reliability.imitation.evaluate --checkpoint models/imitation/${v}_seed${seed}.pt --scenes 1000-1099
   done
+  # Diffusion policy: ~1 hour per seed on 2 CPU cores (minutes on a GPU)
+  python -m policy_reliability.imitation.train --variant diffusion --seed $seed --epochs 250
+  python -m policy_reliability.imitation.evaluate --checkpoint models/imitation/diffusion_seed${seed}.pt --scenes 1000-1099
 done
 python -m policy_reliability.imitation.report
 
-pytest   # metrics, reports, data windows, chunking and ensembling logic (no simulator needed)
+pytest   # metrics, reports, data windows, chunking, ensembling, diffusion sampling (no simulator needed)
 ```
 
 On a small CPU an episode takes about 1–4 minutes; failed episodes are the slow ones, since they run the full 300 steps. The pretrained weights download from the Hugging Face Hub on first run.
@@ -155,13 +181,14 @@ On a small CPU an episode takes about 1–4 minutes; failed episodes are the slo
 ## Limitations
 
 - **Simulation, one task.** PushT is a standard benchmark, but real deployments add contact dynamics, lighting and hardware faults it doesn't model.
-- **Part 1 uses state observations and an MLP.** That keeps training CPU-friendly and the ablation clean, but it isn't vision-based learning; the same comparison with image inputs needs a GPU.
+- **Part 1 uses state observations.** That keeps training CPU-friendly and the ablations clean, but it isn't vision-based learning; the same comparison with image inputs needs a GPU. The diffusion policy is also a scaled-down U-Net trained for 250 epochs; the published Diffusion Policy trains a much larger network far longer, so 60% is a CPU-budget result, not its ceiling.
 - **Small samples.** 15 episodes per condition gives wide intervals. The harness is resumable precisely so this can be scaled up.
 - **One uncertainty signal.** Sample disagreement is cheap and policy-agnostic for generative policies. Ensembles, action-chunk consistency over time and learned failure classifiers are natural comparisons.
 
 ## Next steps
 
-- **Beat the regression ceiling in Part 1:** a generative action head (mixture density or a small diffusion head) on the same data and harness, to measure how much of the gap to diffusion policy is multimodality.
+- **Close the last gap in Part 1:** most remaining diffusion failures are near misses lost in the final adjustment. Test finer sampling (DDPM-100, or more DDIM steps only on the final approach), the fix Part 2 found for the same failure type, paired on the same 300 episodes.
+- **Scale the diffusion policy:** a wider U-Net and longer training on a GPU, plus image observations.
 - **Finish the perturbed conditions:** does uncertainty become predictive when failures are "lost the block" rather than near misses?
 - **Cheaper precision:** full sampling only on the final approach, or 20–50 DDIM steps, to recover most of the 80% at a fraction of the compute. Measured the same way: same seeds, paired.
 - **More scenes:** scale to 50+ scenes per variant to make the sampler result statistically conclusive.
@@ -179,12 +206,13 @@ policy_reliability/
   imitation/
     data.py       demonstrations -> (observation history, action chunk) pairs, split by episode
     model.py      MLP policy; open-loop chunk execution and ACT-style temporal ensembling
-    train.py      training with L1 loss, AdamW, cosine schedule, best-on-validation checkpoint
+    diffusion.py  diffusion policy: conditional 1D U-Net denoiser, DDPM training, DDIM sampling
+    train.py      regression (L1, best-on-validation) and diffusion (EMA, final weights) training
     evaluate.py   resumable rollouts on fixed evaluation scenes
     report.py     results/imitation/report.md + chart, paired comparisons
     clip.py       render a rollout to a GIF
 models/diffusion_pusht/   normalisation stats in LeRobot 0.6 processor format
-models/imitation/         the two checkpoints used in the clips (retrain any variant in ~90 s)
+models/imitation/         the three checkpoints used in the clips
 results/                  episodes.jsonl, report.md, charts, clips
-tests/                    metrics, reports, conditions, data windows, chunking and ensembling
+tests/                    metrics, reports, conditions, data windows, chunking, ensembling, diffusion
 ```

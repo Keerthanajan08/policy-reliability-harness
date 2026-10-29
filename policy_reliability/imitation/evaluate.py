@@ -19,16 +19,16 @@ import gymnasium as gym
 import numpy as np
 import torch
 
-from policy_reliability.imitation.model import Controller, MLPPolicy, Variant
+from policy_reliability.imitation.model import Controller, Variant, build_policy
 from policy_reliability.metrics import parse_seeds
 
 ROOT = Path(__file__).resolve().parents[2]
 MAX_STEPS = 300
 
 
-def load_policy(path: Path) -> MLPPolicy:
+def load_policy(path: Path) -> torch.nn.Module:
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
-    policy = MLPPolicy(Variant(**ckpt["variant"]))
+    policy = build_policy(Variant(**ckpt["variant"]))
     policy.load_state_dict(ckpt["state_dict"])
     return policy
 
@@ -42,6 +42,7 @@ def rollout(controller: Controller, scene: int) -> dict:
         "gym_pusht/PushT-v0", obs_type="environment_state_agent_pos", max_episode_steps=MAX_STEPS
     )
     obs, _ = env.reset(seed=scene)
+    torch.manual_seed(scene)  # diffusion sampling noise: reproducible per scene
     controller.reset()
     progress: list[float] = []
     success = False

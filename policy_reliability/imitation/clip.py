@@ -12,6 +12,7 @@ import gym_pusht  # noqa: F401  (registers the environment)
 import gymnasium as gym
 import imageio.v2 as imageio
 import numpy as np
+import torch
 from PIL import Image
 
 from policy_reliability.imitation.evaluate import MAX_STEPS, ROOT, load_policy, observation
@@ -33,6 +34,7 @@ def main() -> None:
         max_episode_steps=MAX_STEPS,
     )
     obs, _ = env.reset(seed=args.scene)
+    torch.manual_seed(args.scene)  # same sampling noise as evaluate.py
     frames, success = [], False
     for step in range(MAX_STEPS):
         if step % 2 == 0:

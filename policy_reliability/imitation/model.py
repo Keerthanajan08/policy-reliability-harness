@@ -20,7 +20,9 @@ class Variant:
     name: str
     history: int  # observation frames fed to the network
     chunk: int  # future actions predicted per query
-    execute: str  # "open_loop": run the whole chunk; "ensemble": re-plan every step
+    execute: str  # "open_loop": run the chunk then re-plan; "ensemble": re-plan every step
+    kind: str = "regression"  # "regression" (MLP, L1 loss) or "diffusion" (generative)
+    execute_steps: int | None = None  # open loop: actions run per chunk (default: all)
 
 
 VARIANTS = {
@@ -32,6 +34,12 @@ VARIANTS = {
         Variant("chunk16", history=2, chunk=16, execute="open_loop"),
         Variant("chunk8_ensemble", history=2, chunk=8, execute="ensemble"),
         Variant("chunk16_ensemble", history=2, chunk=16, execute="ensemble"),
+        # Matched pair: predict 16, execute 8 (Diffusion Policy's setting). Only the
+        # model differs: regression of the mean chunk vs sampling a chunk.
+        Variant("chunk16_exec8", history=2, chunk=16, execute="open_loop", execute_steps=8),
+        Variant(
+            "diffusion", history=2, chunk=16, execute="open_loop", kind="diffusion", execute_steps=8
+        ),
     )
 }
 
@@ -50,6 +58,9 @@ class MLPPolicy(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x)
 
+    def predict(self, x: torch.Tensor) -> torch.Tensor:
+        return self(x)
+
     def config(self) -> dict:
         return asdict(self.variant)
 
@@ -58,13 +69,14 @@ class Controller:
     """
     Turns a trained policy into one action per environment step.
 
-    open_loop: query once per chunk and execute all of it (ACT's "action chunking").
+    open_loop: query once, execute the first execute_steps actions (default: the whole
+               chunk, ACT's "action chunking"), then query again.
     ensemble:  query every step; the action for step t is a weighted average of every
                chunk that predicted step t, with weight exp(-m * age), so the oldest
                prediction counts most (ACT's temporal ensembling, m = 0.01).
     """
 
-    def __init__(self, policy: MLPPolicy, ensemble_m: float = 0.01) -> None:
+    def __init__(self, policy: nn.Module, ensemble_m: float = 0.01) -> None:
         self.policy = policy.eval()
         self.v = policy.variant
         self.m = ensemble_m
@@ -82,13 +94,13 @@ class Controller:
         while len(hist) < self.v.history:  # pad with the first frame, as in training
             hist.insert(0, hist[0])
         x = torch.from_numpy(np.concatenate(hist)[None]).float()
-        return self.policy(x).numpy().reshape(self.v.chunk, ACT_DIM)
+        return self.policy.predict(x).numpy().reshape(self.v.chunk, ACT_DIM)
 
     def act(self, obs: np.ndarray) -> np.ndarray:
         self.history.append(normalize(obs.astype(np.float32)))
         if self.v.execute == "open_loop":
             if not self.queue:
-                self.queue.extend(self._predict())
+                self.queue.extend(self._predict()[: self.v.execute_steps or self.v.chunk])
             action = self.queue.popleft()
         else:
             chunk = self._predict()
@@ -99,3 +111,11 @@ class Controller:
             action = (weights[:, None] * preds).sum(0) / weights.sum()
         self.t += 1
         return denormalize(action)
+
+
+def build_policy(variant: Variant) -> nn.Module:
+    if variant.kind == "diffusion":
+        from policy_reliability.imitation.diffusion import DiffusionPolicy
+
+        return DiffusionPolicy(variant)
+    return MLPPolicy(variant)

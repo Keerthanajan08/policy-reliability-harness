@@ -96,3 +96,34 @@ def test_ensemble_weights_favour_older_predictions():
     ctrl.act(obs)
     a1 = normalize(ctrl.act(obs))[0]  # predictions 0 (old, weight 1) and 1 (new, weight e^-1)
     assert a1 == pytest.approx((0 * 1 + 1 * np.exp(-1)) / (1 + np.exp(-1)))
+
+
+def test_open_loop_can_execute_part_of_each_chunk():
+    policy = FixedChunk(Variant("t", history=1, chunk=4, execute="open_loop", execute_steps=2))
+    ctrl = Controller(policy)
+    obs = np.zeros(OBS_DIM, np.float32)
+    actions = [normalize(ctrl.act(obs))[0] for _ in range(4)]
+    assert policy.calls == 2  # re-plans after 2 of the 4 predicted steps
+    assert actions == pytest.approx([0.0, 0.01, 0.01, 0.02])
+
+
+def test_diffusion_policy_samples_valid_chunks_and_learns():
+    from policy_reliability.imitation.diffusion import DiffusionPolicy
+
+    torch.manual_seed(0)
+    v = Variant("d", history=2, chunk=4, execute="open_loop", kind="diffusion")
+    policy = DiffusionPolicy(v)
+    obs = torch.zeros(3, 2 * OBS_DIM)
+    chunk = policy.predict(obs)
+    assert chunk.shape == (3, 4 * ACT_DIM)
+    assert chunk.abs().max() <= 1.0  # samples stay inside the normalised workspace
+
+    actions = torch.full((64, 4 * ACT_DIM), 0.5)  # one action to learn
+    opt = torch.optim.Adam(policy.denoiser.parameters(), lr=1e-3)
+    first = policy.loss(obs[:1].expand(64, -1), actions).item()
+    for _ in range(200):
+        loss = policy.loss(obs[:1].expand(64, -1), actions)
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+    assert loss.item() < first / 2

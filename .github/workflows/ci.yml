@@ -16,7 +16,7 @@ jobs:
       # Metrics, reports and the imitation-learning logic don't need the simulator,
       # LeRobot or a GPU, so CI stays fast and CPU-only.
       - run: pip install torch --index-url https://download.pytorch.org/whl/cpu
-      - run: pip install numpy matplotlib pytest ruff
+      - run: pip install numpy matplotlib diffusers pytest ruff
       - run: ruff check .
       - run: ruff format --check .
       - run: pytest tests/test_metrics.py tests/test_report.py tests/test_imitation.py

@@ -20,7 +20,7 @@ import matplotlib.pyplot as plt  # noqa: E402
 
 from policy_reliability.imitation.model import VARIANTS  # noqa: E402
 from policy_reliability.metrics import mcnemar_exact, wilson_interval  # noqa: E402
-from policy_reliability.report import BLUE, GRID, INK, INK2, SURFACE, _style  # noqa: E402
+from policy_reliability.report import BLUE, GRID, INK, INK2, ORANGE, SURFACE, _style  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[2]
 RESULTS = ROOT / "results" / "imitation"
@@ -32,6 +32,8 @@ LABELS = {
     "chunk16": "Chunking (16)",
     "chunk8_ensemble": "Chunking (8) + ensembling",
     "chunk16_ensemble": "Chunking (16) + ensembling",
+    "chunk16_exec8": "Regression, plan 16 / run 8",
+    "diffusion": "Diffusion, plan 16 / run 8",
 }
 
 
@@ -66,7 +68,7 @@ def paired(a: list[dict], b: list[dict]) -> tuple[int, int, int]:
 
 
 def chart(data: dict[str, list[dict]], path: Path) -> None:
-    fig, ax = plt.subplots(figsize=(7.5, 1.1 + 0.55 * len(data)), facecolor=SURFACE)
+    fig, ax = plt.subplots(figsize=(7.5, 1.4 + 0.55 * len(data)), facecolor=SURFACE)
     _style(ax)
     names = list(data)[::-1]
     stats = []
@@ -78,7 +80,8 @@ def chart(data: dict[str, list[dict]], path: Path) -> None:
     top = max(max(hi, *(v * 100 for v in seeds.values())) for *_, hi, seeds in stats)
     upper = 10 * (int(top // 10) + 1)
     for i, (wins, n, rate, lo, hi, seeds) in enumerate(stats):
-        ax.barh(i, rate, height=0.55, color=BLUE)
+        generative = VARIANTS[names[i]].kind == "diffusion"
+        ax.barh(i, rate, height=0.55, color=ORANGE if generative else BLUE)
         ax.errorbar(
             rate,
             i,
@@ -100,7 +103,8 @@ def chart(data: dict[str, list[dict]], path: Path) -> None:
     ax.set_axisbelow(True)
     ax.set_title(
         "Imitation learning from scratch: task success\n"
-        "bar = all seeds pooled (95% CI) · dot = one training seed",
+        "bar = all seeds pooled (95% CI) · dot = one training seed\n"
+        "blue = regression (MLP) · orange = diffusion (1D U-Net)",
         loc="left",
         color=INK,
         fontsize=11,
@@ -119,7 +123,7 @@ def main() -> None:
     data = load(RESULTS / "episodes.jsonl")
     training = [json.loads(line) for line in (RESULTS / "training.jsonl").open() if line.strip()]
     lines = ["# Imitation learning from scratch (PushT, state observations)", ""]
-    any_rec = next(iter(training), None)
+    any_rec = next((t for t in training if "train_demos" in t), None)
     if any_rec:
         lines += [
             f"Trained on {any_rec['train_demos']} human demonstrations "
@@ -155,6 +159,9 @@ def main() -> None:
     questions = [("bc_single_step", v) for v in data if v != "bc_single_step"]
     questions += [("chunk8", v) for v in ("chunk4", "chunk16") if v in data]
     questions += [(f"chunk{k}", f"chunk{k}_ensemble") for k in (8, 16)]
+    # Does a generative model beat regression? Matched (same horizon and execution),
+    # and against the best regression policy.
+    questions += [("chunk16_exec8", "diffusion"), ("chunk8_ensemble", "diffusion")]
     for a, b in questions:
         if a not in data or b not in data:
             continue
@@ -168,18 +175,24 @@ def main() -> None:
         "",
         "## Training",
         "",
-        "| Variant | Seed | Best validation L1 | Seconds |",
+        "| Variant | Seed | Validation loss | Seconds |",
         "|---|---|---|---|",
     ]
     for t in training:
+        val = (
+            f"{t['best_val_l1']:.4f} (best L1)"
+            if "best_val_l1" in t
+            else f"{t['final_val_denoising_mse']:.4f} (denoising MSE, final)"
+        )
         lines.append(
-            f"| {LABELS.get(t['variant'], t['variant'])} | {t['seed']} | "
-            f"{t['best_val_l1']:.4f} | {t['seconds']:.0f} |"
+            f"| {LABELS.get(t['variant'], t['variant'])} | {t['seed']} | {val} | "
+            f"{t['seconds']:.0f} |"
         )
     lines += [
         "",
-        "Validation L1 is not comparable across variants: predicting 16 future actions "
-        "is a harder target than predicting 1. Task success is the comparison that counts.",
+        "Validation losses are not comparable across variants: predicting 16 future actions "
+        "is a harder target than predicting 1, and a denoising loss measures something else "
+        "entirely. Task success is the comparison that counts.",
         "",
     ]
 
